@@ -1,0 +1,224 @@
+# Managed by CodeNinja — changes to this file may be overwritten.
+name: codeninja-build
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set +e
+          JAVA=17
+          GRADLE_OUT=8.7
+          AGP=""
+          GRADLE_VER=""
+
+          AGP=$(grep -rhoE "com\.android\.tools\.build:gradle: *[\"']?[0-9]+\.[0-9]+(\.[0-9]+)?" --include='*.gradle' --include='*.gradle.kts' --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+
+          if [ -z "$AGP" ]; then
+            AGP=$(grep -rhoiE "^[[:space:]]*(agp|androidGradlePlugin|androidGradle|android)[[:space:]]*=[[:space:]]*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"" --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+          fi
+
+          if [ -z "$AGP" ]; then
+            REF=$(grep -rh "com\.android\.tools\.build:gradle\|com\.android\.application\|com\.android\.library\|com\.android\.dynamic-feature" --include='*.toml' . 2>/dev/null | grep -o "version\.ref *= *\"[^\"]*\"" | head -1 | sed -E 's/.*"([^"]*)".*/\1/')
+            if [ -n "$REF" ]; then
+              AGP=$(grep -rhoiE "^[[:space:]]*$REF[[:space:]]*=[[:space:]]*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"" --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+            fi
+          fi
+
+          if [ -z "$AGP" ]; then
+            AGP=$(grep -rh "com\.android\.application\|com\.android\.library\|com\.android\.dynamic-feature" --include='*.gradle' --include='*.gradle.kts' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+          fi
+
+          # The wrapper is the project's own Gradle declaration. A native Android repo
+          # keeps it at the root; a Flutter app keeps it under android/.
+          for WRAP in gradle/wrapper/gradle-wrapper.properties android/gradle/wrapper/gradle-wrapper.properties; do
+            if [ -f "$WRAP" ]; then
+              GRADLE_VER=$(grep -oE "gradle-[0-9]+(\.[0-9]+)+" "$WRAP" | head -1 | cut -d- -f2)
+              break
+            fi
+          done
+
+          # Floor: the oldest JVM that can still host this AGP/Gradle pair.
+          FLOOR_JAVA=$JAVA
+          FLOOR_GRADLE=$GRADLE_OUT
+          if [ -n "$AGP" ]; then
+            AGP_MAJOR=$(echo "$AGP" | cut -d. -f1)
+            AGP_MINOR=$(echo "$AGP" | cut -d. -f2)
+            [ -z "$AGP_MINOR" ] && AGP_MINOR=0
+            if [ "$AGP_MAJOR" -lt 8 ] 2>/dev/null; then
+              FLOOR_JAVA=11
+              FLOOR_GRADLE=7.6.4
+            fi
+            if [ "$AGP_MAJOR" -ge 9 ] 2>/dev/null; then FLOOR_GRADLE=9.0; fi
+            if [ "$AGP_MAJOR" -eq 8 ] 2>/dev/null && [ "$AGP_MINOR" -ge 7 ] 2>/dev/null; then FLOOR_GRADLE=8.11.1; fi
+          elif [ -n "$GRADLE_VER" ]; then
+            G_MAJOR=$(echo "$GRADLE_VER" | cut -d. -f1)
+            G_MINOR=$(echo "$GRADLE_VER" | cut -d. -f2)
+            [ -z "$G_MINOR" ] && G_MINOR=0
+            if [ "$G_MAJOR" -lt 7 ] 2>/dev/null; then
+              FLOOR_JAVA=11
+              FLOOR_GRADLE=7.6.4
+            fi
+            if [ "$G_MAJOR" -eq 7 ] 2>/dev/null && [ "$G_MINOR" -lt 3 ] 2>/dev/null; then
+              FLOOR_JAVA=11
+              FLOOR_GRADLE=7.6.4
+            fi
+          fi
+
+          # Read only what the project *declares*, i.e. an assignment. A bare
+          # "JavaVersion.VERSION_22" inside "if (JavaVersion.current() >= ...)"
+          # is a runtime condition, not a requirement; matching it once chose
+          # JDK 22 for a project targeting 21 and tripped that project's own
+          # version guard into adding a javac flag that only exists on 23+.
+          # "VERSION_1_8" yields both 1 and 8 and the max below picks 8.
+          EXPLICIT=$(grep -rhoE "jvmToolchain[[:space:]]*\([[:space:]]*[0-9]+|JavaLanguageVersion\.of[[:space:]]*\([[:space:]]*[0-9]+|(source|target)Compatibility[[:space:]]*=?[[:space:]]*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?|jvmTarget[[:space:]]*=[[:space:]]*[\"'][0-9]+|jvmTarget\.set\([[:space:]]*[\"']?[0-9]+|(^|[^[:alnum:]_])release[[:space:]]*=[[:space:]]*[0-9]+|release\.set\([[:space:]]*[0-9]+" --include='*.gradle' --include='*.gradle.kts' --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+" | sort -rn | head -1)
+
+          JAVA=$FLOOR_JAVA
+          if [ -n "$EXPLICIT" ] && [ "$EXPLICIT" -gt "$JAVA" ] 2>/dev/null; then
+            JAVA=$EXPLICIT
+          fi
+
+          # Only a wrapperless repo uses the floor; prefer what ./gradlew actually runs.
+          if [ -n "$GRADLE_VER" ]; then
+            GRADLE_OUT=$GRADLE_VER
+          else
+            GRADLE_OUT=$FLOOR_GRADLE
+          fi
+          if [ "$JAVA" -ge 21 ] 2>/dev/null && [ "$(echo "$GRADLE_OUT" | cut -d. -f1)" -lt 8 ] 2>/dev/null; then
+            GRADLE_OUT=8.7
+          fi
+
+          # An exact Flutter pin. A range (">=3.16.0", "^3.0.0") is deliberately not a
+          # match: pinning to an old SDK we would have to download is worse than the
+          # stable channel, and a range always resolves against whatever we install.
+          FLUTTER_VER=""
+          if [ -f pubspec.yaml ]; then
+            FLUTTER_VER=$(grep -oE "^[[:space:]]+flutter:[[:space:]]*[\"']?[0-9]+\.[0-9]+\.[0-9]+" pubspec.yaml | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+          fi
+
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+          echo "gradle=$GRADLE_OUT" >> "$GITHUB_OUTPUT"
+          echo "flutter=$FLUTTER_VER" >> "$GITHUB_OUTPUT"
+          echo "Detected AGP=$AGP Gradle=$GRADLE_VER Declared=$EXPLICIT floor=$FLOOR_JAVA -> JDK $JAVA, Gradle $GRADLE_OUT"
+          if [ -n "$FLUTTER_VER" ]; then
+            echo "Pinned Flutter $FLUTTER_VER"
+          fi
+
+          # A project may declare a release signingConfig that expects a keystore it does
+          # not ship — key.properties is in every Flutter app's .gitignore. The source
+          # compiles fine and then the build dies at :app:packageRelease, which would
+          # break the "zero setup: it just builds" promise. Fall back to the debug key,
+          # but only when no keystore is genuinely available: a repo that supplies one
+          # keeps its own signing config untouched.
+          HAS_KEYSTORE=""
+          for KP in key.properties keystore.properties android/key.properties android/keystore.properties; do
+            if [ -f "$KP" ]; then
+              HAS_KEYSTORE=1
+            fi
+          done
+          if [ -n "$ANDROID_KEYSTORE_PATH" ] || [ -n "$ANDROID_KEY_PATH" ]; then
+            HAS_KEYSTORE=1
+          fi
+
+          SIGNING_NOTE=""
+          if [ -z "$HAS_KEYSTORE" ]; then
+            for SGRADLE in android/app/build.gradle android/app/build.gradle.kts app/build.gradle app/build.gradle.kts; do
+              if [ -f "$SGRADLE" ] && grep -q -e 'signingConfigs\.release' -e 'getByName("release")' -e "getByName('release')" "$SGRADLE"; then
+                # /signingConfig/ keeps the edit on the one line that assigns it, so an
+                # unrelated getByName("release") elsewhere in the file is left alone.
+                sed -i.bak \
+                  -e '/signingConfig/s/signingConfig[[:space:]][[:space:]]*signingConfigs\.release/signingConfig signingConfigs.debug/g' \
+                  -e '/signingConfig/s/getByName("release")/getByName("debug")/g' \
+                  -e "/signingConfig/s/getByName('release')/getByName('debug')/g" \
+                  "$SGRADLE"
+                if ! cmp -s "$SGRADLE" "$SGRADLE.bak"; then
+                  SIGNING_NOTE=$SGRADLE
+                fi
+                rm -f "$SGRADLE.bak"
+              fi
+            done
+          fi
+          if [ -n "$SIGNING_NOTE" ]; then
+            echo "No keystore found; $SIGNING_NOTE release build will be debug-signed (add android/key.properties to sign properly)"
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.toolchain.outputs.java }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.toolchain.outputs.gradle }}
+
+      - name: Build debug APK
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+          else
+            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+          fi
+
+      # A failure that is really "the JVM we picked was wrong" gets one attempt
+      # on a newer JDK. Such requirements never appear in the source tree — a
+      # plugin declares them in its published metadata, a build script guards on
+      # JavaVersion.current() — so they only surface once the build runs.
+      # Anything else fails here, unchanged.
+      - name: Check build failure
+        id: check
+        if: steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          CUR=${{ steps.toolchain.outputs.java }}
+          if [ ! -f build.log ] || [ "$CUR" -ge 25 ] || ! grep -qE "requires at least JVM runtime version|invalid flag:|invalid source release|Unsupported class file major version|Could not determine Java version|does not support (running on )?Java|This build uses a Java [0-9]+ JVM" build.log; then
+            echo "retry=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$CUR" -lt 21 ]; then NEXT=21; elif [ "$CUR" -lt 23 ]; then NEXT=23; else NEXT=25; fi
+          echo "retry=true" >> "$GITHUB_OUTPUT"
+          echo "java=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "JVM-shaped failure on JDK $CUR -> retrying on JDK $NEXT"
+
+      - name: Set up Java (retry)
+        if: steps.check.outputs.retry == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.check.outputs.java }}
+
+      - name: Build debug APK (retry)
+        if: steps.check.outputs.retry == 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+          else
+            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+          fi
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: "**/build/outputs/apk/**/*.apk"
+          if-no-files-found: error
+          retention-days: 90
